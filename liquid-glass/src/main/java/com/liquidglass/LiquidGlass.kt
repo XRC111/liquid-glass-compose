@@ -197,20 +197,29 @@ fun Modifier.liquidGlassSource(
 
                 // toImageBitmap 是挂起函数，提交到协程读取像素
                 scope.launch {
-                    val bitmap = runCatching { layer.toImageBitmap() }.getOrNull()
-                    if (bitmap == null) {
+                    val captured = runCatching { layer.toImageBitmap() }.getOrNull()
+                    if (captured == null) {
                         Log.w(LG_TAG, "background capture failed; refraction disabled")
                         state.onBackgroundCaptured(null)
                         return@launch
                     }
-                    if (submitted[0] === bitmap) return@launch
-                    submitted[0] = bitmap
-                    state.onBackgroundCaptured(bitmap)
+                    if (submitted[0] === captured) return@launch
+                    submitted[0] = captured
+                    state.onBackgroundCaptured(captured)
 
-                    // 异步 CPU 模糊，避免阻塞绘制
+                    // 异步 CPU 模糊，避免阻塞绘制。
+                    // 整段包 runCatching：Android 13+ 捕获结果是 Config#HARDWARE
+                    // 位图，像素不可读。失败时保留未模糊背景继续渲染，
+                    // 绝不让异常冒泡导致宿主应用闪退。
                     val start = System.nanoTime()
                     val blurred = withContext(Dispatchers.Default) {
-                        com.liquidglass.internal.CpuRenderer().blur(bitmap.asAndroidBitmap(), state.quality.blurRadius)
+                        runCatching {
+                            com.liquidglass.internal.CpuRenderer()
+                                .blur(captured.asAndroidBitmap(), state.quality.blurRadius)
+                        }.getOrElse { t ->
+                            Log.w(LG_TAG, "CPU blur failed; using unblurred background", t)
+                            captured.asAndroidBitmap()
+                        }
                     }
                     state.blurredBackground = blurred.asImageBitmap()
                     state.lastRenderCostMs = (System.nanoTime() - start) / 1_000_000f
