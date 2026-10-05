@@ -2,6 +2,7 @@ package com.liquidglass.internal
 
 import android.graphics.Bitmap
 import android.os.Build
+import android.util.Log
 import androidx.annotation.RequiresApi
 import com.liquidglass.AgslShaders
 import com.liquidglass.LiquidGlassState
@@ -25,19 +26,21 @@ public class AgslRenderer internal constructor() {
     private val shader = android.graphics.RuntimeShader(AgslShaders.GLASS_AGSL)
 
     /**
-     * 预热着色器，避免首帧编译卡顿。
+     * 预热着色器，触发 SkSL 编译与管线构建，避免首帧卡顿。
      *
-     * 用 8×8 的小位图跑一次空绘制，触发 SkSL 编译与 GPU 管线预热。
-     * 首次创建玻璃卡片时调用，可显著降低首帧延迟。
+     * @return 预热是否成功。部分厂商驱动无法编译 AGSL，此时返回 `false`；
+     *   调用方应据此降级到不依赖 AGSL 的渲染路径，而不是继续使用本渲染器。
      */
-    public fun warmUp() {
-        runCatching {
-            val bmp = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
-            val canvas = android.graphics.Canvas(bmp)
-            val paint = android.graphics.Paint().apply { this.shader = shader }
-            canvas.drawRect(0f, 0f, 8f, 8f, paint)
-            bmp.recycle()
-        }
+    public fun warmUp(): Boolean = runCatching {
+        val bmp = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bmp)
+        val paint = android.graphics.Paint().apply { this.shader = shader }
+        canvas.drawRect(0f, 0f, 8f, 8f, paint)
+        bmp.recycle()
+        true
+    }.getOrElse { t ->
+        Log.w(TAG, "AGSL shader warm-up failed; caller should fall back", t)
+        false
     }
 
     /**
@@ -46,26 +49,35 @@ public class AgslRenderer internal constructor() {
      * @param width 玻璃容器宽（px）
      * @param height 玻璃容器高（px）
      * @param state 玻璃状态，提供触摸点、色散、厚度等参数
-     * @return 可直接挂到 `GraphicsLayer.renderEffect` 的 RenderEffect
+     * @return 可直接挂到 `GraphicsLayer.renderEffect` 的 RenderEffect；
+     *   若驱动拒绝该 uniform 设置则返回 `null`，调用方应跳过本帧的硬件效果
      */
     public fun updateEffect(
         width: Int,
         height: Int,
         state: LiquidGlassState,
-    ): android.graphics.RenderEffect {
+    ): android.graphics.RenderEffect? {
         val n = state.normalizedTouch()
-        shader.setFloatUniform("resolution", width.toFloat(), height.toFloat())
-        shader.setFloatUniform("mouse", n.x * width, n.y * height)
-        shader.setFloatUniform("touchStrength", state.touchStrength)
-        shader.setFloatUniform("refractiveIndex", REFRACTIVE_INDEX)
-        shader.setFloatUniform("dispersion", state.quality.dispersion)
-        shader.setFloatUniform("edgeRadius", state.cornerRadiusPx)
-        shader.setFloatUniform("thickness", state.thicknessPx)
-        shader.setColorUniform("tint", state.tint.toArgbInt())
-        return android.graphics.RenderEffect.createRuntimeShaderEffect(shader, UNIFORM_IMAGE)
+        return runCatching {
+            shader.setFloatUniform("resolution", width.toFloat(), height.toFloat())
+            shader.setFloatUniform("mouse", n.x * width, n.y * height)
+            shader.setFloatUniform("touchStrength", state.touchStrength)
+            shader.setFloatUniform("refractiveIndex", REFRACTIVE_INDEX)
+            shader.setFloatUniform("dispersion", state.quality.dispersion)
+            shader.setFloatUniform("edgeRadius", state.cornerRadiusPx)
+            shader.setFloatUniform("thickness", state.thicknessPx)
+            shader.setColorUniform("tint", state.tint.toArgbInt())
+            android.graphics.RenderEffect.createRuntimeShaderEffect(shader, UNIFORM_IMAGE)
+        }.getOrElse { t ->
+            Log.w(TAG, "AGSL uniform update failed; skipping refraction this frame", t)
+            null
+        }
     }
 
     internal companion object {
+        /** Logcat 标签。 */
+        const val TAG = "LiquidGlass"
+
         /** 玻璃典型折射率。 */
         const val REFRACTIVE_INDEX = 1.5f
 

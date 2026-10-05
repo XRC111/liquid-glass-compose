@@ -259,11 +259,23 @@ private fun Modifier.liquidGlassInternal(
 
     if (state.quality == GlassQuality.Full && Build.VERSION.SDK_INT >= 33) {
         if (agslLayer[0] == null) {
-            agslLayer[0] = com.liquidglass.internal.AgslRenderer().also { it.warmUp() }
-            state.shaderWarmedUp = true
+            val renderer = com.liquidglass.internal.AgslRenderer()
+            // warmUp 返回真实结果：部分厂商驱动无法编译 AGSL，
+            // 此时若把 shaderWarmedUp 误标为 true，后续每帧 updateEffect
+            // 都会抛异常导致宿主应用闪退。失败即降级到 CPU 路径。
+            val ok = renderer.warmUp()
+            state.shaderWarmedUp = ok
+            if (ok) {
+                agslLayer[0] = renderer
+            } else {
+                state.quality = GlassQuality.Minimal
+                fallbackRenderer[0] = LiquidGlassFallback.create(GlassQuality.Minimal)
+            }
         }
     } else if (state.quality == GlassQuality.Medium && Build.VERSION.SDK_INT >= 31) {
-        effectLayer[0] = com.liquidglass.internal.RenderEffectRenderer()
+        if (effectLayer[0] == null) {
+            effectLayer[0] = com.liquidglass.internal.RenderEffectRenderer()
+        }
     } else {
         fallbackRenderer[0] = LiquidGlassFallback.create(state.quality)
     }
@@ -320,17 +332,42 @@ private fun Modifier.liquidGlassInternal(
                 val offX = state.positionInWindow.x - state.sourcePosition.x
                 val offY = state.positionInWindow.y - state.sourcePosition.y
 
+                // 图层由组合阶段创建，但绘制可能先于赋值执行（时序不保证），
+                // 或 updateEffect 因驱动问题返回 null。此处统一做可空校验，
+                // 任一硬件路径不可用即回退到 CPU 渲染，宿主应用不会崩溃。
+                val agsl = agslLayer[0]
+                val effect = effectLayer[0]
+                val agslEffect = if (
+                    q == GlassQuality.Full && bg != null &&
+                    Build.VERSION.SDK_INT >= 33 && agsl != null
+                ) {
+                    agsl.updateEffect(iw, ih, state)
+                } else {
+                    null
+                }
+                val renderEffect = if (
+                    agslEffect == null &&
+                    q == GlassQuality.Medium && bg != null &&
+                    Build.VERSION.SDK_INT >= 31 && effect != null
+                ) {
+                    runCatching {
+                        effect.blurEffect(with(density) { q.blurRadius.dp.toPx() })
+                    }.getOrNull()
+                } else {
+                    null
+                }
+
                 when {
                     // ---- API 33+：AGSL 完整液态玻璃 ----
-                    q == GlassQuality.Full && bg != null && Build.VERSION.SDK_INT >= 33 -> {
-                        glassLayer.renderEffect =
-                            agslLayer[0]!!.updateEffect(iw, ih, state).asComposeRenderEffect()
+                    agslEffect != null && bg != null -> {
+                        val src = bg
+                        glassLayer.renderEffect = agslEffect.asComposeRenderEffect()
                         glassLayer.record(density, layoutDirection, IntSize(iw, ih)) {
                             clipPath(path) {
                                 drawImage(
-                                    image = bg,
+                                    image = src,
                                     srcOffset = IntOffset.Zero,
-                                    srcSize = IntSize(bg.width.coerceAtLeast(1), bg.height.coerceAtLeast(1)),
+                                    srcSize = IntSize(src.width.coerceAtLeast(1), src.height.coerceAtLeast(1)),
                                     dstOffset = IntOffset(offX, offY),
                                     dstSize = IntSize(iw, ih),
                                 )
@@ -340,16 +377,15 @@ private fun Modifier.liquidGlassInternal(
                     }
 
                     // ---- API 31-32：RenderEffect 硬件模糊 ----
-                    q == GlassQuality.Medium && bg != null && Build.VERSION.SDK_INT >= 31 -> {
-                        val blurPx = with(density) { (q.blurRadius.dp).toPx() }
-                        glassLayer.renderEffect =
-                            effectLayer[0]!!.blurEffect(blurPx).asComposeRenderEffect()
+                    renderEffect != null && bg != null -> {
+                        val src = bg
+                        glassLayer.renderEffect = renderEffect.asComposeRenderEffect()
                         glassLayer.record(density, layoutDirection, IntSize(iw, ih)) {
                             clipPath(path) {
                                 drawImage(
-                                    image = bg,
+                                    image = src,
                                     srcOffset = IntOffset.Zero,
-                                    srcSize = IntSize(bg.width.coerceAtLeast(1), bg.height.coerceAtLeast(1)),
+                                    srcSize = IntSize(src.width.coerceAtLeast(1), src.height.coerceAtLeast(1)),
                                     dstOffset = IntOffset(offX, offY),
                                     dstSize = IntSize(iw, ih),
                                 )
@@ -362,11 +398,17 @@ private fun Modifier.liquidGlassInternal(
                         }
                     }
 
-                    // ---- API 24-30：CPU 模糊 + Canvas 合成 ----
-                    q == GlassQuality.Minimal -> {
+                    // ---- API 24-30，或 Full / Medium 档硬件路径不可用时的回退 ----
+                    q == GlassQuality.Minimal || q == GlassQuality.Full || q == GlassQuality.Medium -> {
                         currentBackground = bg
                         backgroundDstOffset = IntOffset(offX, offY)
-                        with(fallbackRenderer[0] ?: LiquidGlassFallback.GradientRenderer(q)) {
+                        val fb = fallbackRenderer[0]
+                            ?: if (bg == null) {
+                                LiquidGlassFallback.GradientRenderer(GlassQuality.Fallback)
+                            } else {
+                                LiquidGlassFallback.create(q)
+                            }
+                        with(fb) {
                             drawGlassBase(radiusPx, q.alpha, touch, ts)
                             drawGlassRim(radiusPx, touch, ts)
                         }
