@@ -166,4 +166,4 @@ fun Demo() {
 
 ## License
 
-MIT
+MIT（见 [LICENSE](./LICENSE)）
